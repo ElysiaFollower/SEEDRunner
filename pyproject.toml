@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seed-runner"
+version = "0.1.0"
+description = "Autonomous SEED experiment runner with AI agent support"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "SEEDRunner Team"}
+]
+
+dependencies = [
+    "paramiko>=2.11.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=0.19.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=3.0",
+    "black>=22.0",
+    "flake8>=4.0",
+    "mypy>=0.950",
+]
+
+[project.scripts]
+seed-runner = "seed_runner.cli:main"
+
+[tool.setuptools]
+packages = ["seed_runner"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38']
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: exercises the real VM-backed seed-runner workflow",
+]
