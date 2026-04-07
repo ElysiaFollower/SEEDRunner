@@ -45,3 +45,7 @@ logs/
 *.log
 .claude/
 .tmp-seed-runner-*/
+runs/*/artifacts/
+runs/*/logs/
+runs/*/report/
+runs/*/.tmp/

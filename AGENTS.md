@@ -31,6 +31,7 @@ SEEDRunner is designed to work with Claude AI agents (via Claude API or Codex fr
 Agents interact with `seed-runner` via command-line interface:
 
 ```bash
+cd runs/exp-web-01
 seed-runner mount create --machine vm-seed-01 --local-dir ./artifacts
 seed-runner session create --machine vm-seed-01 --mount-id mnt_xxx --name exp-web-01
 seed-runner session exec --session sess_xxx --cmd "make"
@@ -39,10 +40,11 @@ seed-runner session status --session sess_xxx
 
 ### 2. File System
 
-Agents read execution logs and artifacts from the local mount point:
+Agents should work inside a dedicated experiment directory under `runs/` and
+read execution logs and artifacts from the local mount point in that workspace:
 
 ```
-./artifacts/
+./runs/exp-web-01/artifacts/
 ├── logs/
 │   └── exp-web-01/
 │       ├── cmd_001.log
@@ -77,6 +79,7 @@ def run_seed_experiment(machine_id: str, experiment_name: str, commands: List[st
    └─ Output: execution plan
 
 2. Agent initializes environment
+   ├─ Enter or create workspace: runs/<experiment-name>/
    ├─ Create mount: seed-runner mount create ...
    ├─ Create session: seed-runner session create ...
    └─ Verify connectivity
@@ -91,8 +94,8 @@ def run_seed_experiment(machine_id: str, experiment_name: str, commands: List[st
 
 4. Agent generates report
    ├─ Collect all logs and artifacts
-   ├─ Synthesize into formal report
-   └─ Save to ./artifacts/report/
+   ├─ Synthesize into formal report without waiting for human supervision
+   └─ Save to ./report/
 
 5. Agent cleans up
    ├─ Destroy session: seed-runner session destroy ...
@@ -119,6 +122,7 @@ The system maintains no hidden state. All information is either in the CLI retur
 - Commands that fail don't destroy the session (allows debugging)
 - Mounts are separate from sessions (allows reuse)
 - Logs are always preserved (allows audit)
+- Experiments run inside `runs/<experiment>/` so tool code and experiment outputs stay separated
 
 ### 5. Agent Autonomy
 
@@ -127,6 +131,7 @@ Agents are expected to:
 - Interpret acceptance criteria
 - Adjust execution plans based on failures
 - Generate reports without human input
+- Carry the workflow to completion instead of stopping at partial progress updates
 
 ## Example: Agent Executing a Web Security Experiment
 
@@ -134,6 +139,9 @@ Agents are expected to:
 # Pseudo-code showing how an agent might use seed-runner
 
 def run_web_security_experiment(manual_path, labsetup_path, target_vm):
+    os.makedirs("runs/exp-web-01", exist_ok=True)
+    os.chdir("runs/exp-web-01")
+
     # 1. Parse experiment manual
     experiment = parse_manual(manual_path)
     acceptance_criteria = extract_acceptance_criteria(experiment)
@@ -160,7 +168,7 @@ def run_web_security_experiment(manual_path, labsetup_path, target_vm):
     # 4. Generate report
     all_logs = collect_logs("./artifacts/logs/exp-web-01/")
     report = generate_report(experiment, all_logs)
-    save_report("./artifacts/report/exp-web-01.md", report)
+    save_report("./report/exp-web-01.zh.md", report)
     
     # 5. Clean up
     run_cmd("seed-runner session destroy --session {}".format(session['session_id']))
@@ -214,8 +222,15 @@ If a session times out:
 - Break the experiment into smaller steps
 - Check for long-running background processes
 
+### Partial Completion Without Report
+
+If an agent stops after running commands but before writing the report:
+- Treat the task as incomplete
+- Resume from the saved logs and artifacts
+- Write the report before cleanup, or explicitly explain why the report is blocked
+
 ## References
 
-- [API Reference](../docs/reference/SEED_RUNNER_API.md)
-- [Requirements](../REQUIREMENTS.md)
-- [Architecture](../docs/architecture/)
+- [API Reference](docs/reference/SEED_RUNNER_API.md)
+- [Requirements](REQUIREMENTS.md)
+- [Architecture](docs/architecture/)

@@ -59,6 +59,15 @@ needs a different local username or key path, set `SEED_RUNNER_LOCAL_USER` and
 
 ### Basic Usage
 
+For application-layer experiments, create a dedicated workspace under `runs/`
+and invoke `seed-runner` from there instead of using the repository root as the
+working directory:
+
+```bash
+mkdir -p runs/exp-web-01
+cd runs/exp-web-01
+```
+
 ```bash
 # Create a mount
 seed-runner mount create \
@@ -86,6 +95,10 @@ seed-runner session destroy --session sess_20260407_001
 seed-runner mount destroy --mount-id mnt_20260407_001
 ```
 
+This keeps experiment outputs under `runs/<experiment>/artifacts/` and avoids
+mixing lab results with SEEDRunner source files. See [`runs/README.md`](runs/README.md)
+for the expected workspace layout.
+
 ## Documentation
 
 - [API Reference](docs/reference/SEED_RUNNER_API.md) — Complete API specification
@@ -105,6 +118,7 @@ SEEDRunner/
 │   └── utils.py          # Utilities
 ├── tests/                # Test suite
 ├── docs/                 # Documentation
+├── runs/                 # Per-experiment workspaces for application-layer use
 ├── plans/                # Project plans
 ├── evals/                # Evaluation samples
 ├── pyproject.toml        # Project metadata
