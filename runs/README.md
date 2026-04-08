@@ -28,6 +28,16 @@ seed-runner session destroy --session <session-id>
 seed-runner mount destroy --mount-id <mount-id>
 ```
 
+If the default remote mount point conflicts with another live experiment, retry
+mount creation with a unique remote directory, for example:
+
+```bash
+seed-runner mount create \
+  --machine vm-seed-01 \
+  --local-dir ./artifacts \
+  --remote-dir /home/seed/seed-experiments/exp-web-01
+```
+
 Suggested per-experiment layout:
 
 ```text

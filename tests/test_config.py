@@ -4,6 +4,7 @@ Tests for configuration management.
 
 import pytest
 import os
+from pathlib import Path
 from seed_runner.config import ConfigManager, MachineConfig
 
 
@@ -92,3 +93,21 @@ def test_config_manager_list_machines(env_file):
 
     assert "vm-seed-01" in machines
     assert len(machines) >= 1
+
+
+def test_config_manager_discovers_project_env_file_when_cwd_differs(env_file, temp_dir, monkeypatch):
+    """Default config resolution should fall back to the project-level .env.machines."""
+    outside_dir = os.path.join(temp_dir, "outside")
+    os.makedirs(outside_dir, exist_ok=True)
+    monkeypatch.chdir(outside_dir)
+    monkeypatch.delenv("SEED_RUNNER_LOCAL_HOST", raising=False)
+    monkeypatch.delenv("SEED_RUNNER_LOCAL_SSH_PORT", raising=False)
+    monkeypatch.delenv("SEED_RUNNER_LOCAL_USER", raising=False)
+    monkeypatch.delenv("SEED_RUNNER_REMOTE_TO_LOCAL_KEY", raising=False)
+    monkeypatch.setattr("seed_runner.config._get_project_root", lambda: Path(temp_dir))
+
+    config_manager = ConfigManager()
+
+    assert Path(config_manager.env_file).resolve() == Path(env_file).resolve()
+    assert config_manager.has_machine("vm-seed-01")
+    assert os.environ["SEED_RUNNER_LOCAL_HOST"] == "10.0.0.5"

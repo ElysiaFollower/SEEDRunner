@@ -6,12 +6,31 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from seed_runner.remote import execute_ssh_command, run_ssh_command
-from seed_runner.state import load_mount_metadata, load_state, save_mount_metadata, save_state
+from seed_runner.state import load_mount_metadata, load_state, save_mount_metadata, save_state, state_lock
 from seed_runner.utils import ensure_dir, escape_shell_arg, generate_id, get_timestamp, parse_timestamp, read_file
 
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _read_exit_code(log_file: str) -> Optional[int]:
+    """Read the trailing exit code marker from a completed command log."""
+    if not os.path.exists(log_file):
+        return None
+
+    log_content = read_file(log_file)
+    if "exit_code:" not in log_content:
+        return None
+
+    for line in reversed(log_content.strip().splitlines()):
+        if "exit_code:" not in line:
+            continue
+        try:
+            return int(line.split("exit_code:")[-1].strip())
+        except ValueError:
+            continue
+    return None
 
 
 class SessionManager:
@@ -27,11 +46,16 @@ class SessionManager:
         return state["sessions"][session_id]
 
     def _save_session(self, session_info: Dict[str, Any]) -> None:
-        state = self._get_state()
-        state["sessions"][session_info["session_id"]] = session_info
-        save_state(state)
+        with state_lock():
+            state = self._get_state()
+            state["sessions"][session_info["session_id"]] = session_info
+            save_state(state)
 
-    def _compute_status(self, session_info: Dict[str, Any]) -> str:
+    def _compute_status(
+        self,
+        session_info: Dict[str, Any],
+        mount_info: Optional[Dict[str, Any]] = None,
+    ) -> str:
         if session_info.get("status") == "destroyed":
             return "destroyed"
 
@@ -40,8 +64,13 @@ class SessionManager:
         if elapsed_seconds > session_info["timeout_seconds"]:
             return "timeout"
 
-        state = self._get_state()
-        mount = state["mounts"].get(session_info["mount_id"])
+        if session_info.get("busy"):
+            return "busy"
+
+        mount = mount_info
+        if mount is None:
+            state = self._get_state()
+            mount = state["mounts"].get(session_info["mount_id"])
         if not mount or mount.get("status") == "unmounted":
             return "error"
 
@@ -55,18 +84,26 @@ class SessionManager:
             return "error"
         return "active"
 
+    def _busy_error(self, session_info: Dict[str, Any]) -> str:
+        active_command = session_info.get("active_command") or {}
+        label = active_command.get("log_filename") or active_command.get("cmd") or "another command"
+        return f"Session '{session_info['session_id']}' is busy running {label}"
+
     def _update_mount_metadata_session(self, session_info: Dict[str, Any]) -> None:
-        metadata = load_mount_metadata(session_info["local_mount_point"])
-        sessions = metadata.setdefault("sessions", [])
-        sessions.append(
-            {
-                "session_id": session_info["session_id"],
-                "session_name": session_info["session_name"],
-                "created_at": session_info["created_at"],
-                "commands": [],
-            }
-        )
-        save_mount_metadata(session_info["local_mount_point"], metadata)
+        with state_lock():
+            metadata = load_mount_metadata(session_info["local_mount_point"])
+            sessions = metadata.setdefault("sessions", [])
+            if any(item.get("session_id") == session_info["session_id"] for item in sessions):
+                return
+            sessions.append(
+                {
+                    "session_id": session_info["session_id"],
+                    "session_name": session_info["session_name"],
+                    "created_at": session_info["created_at"],
+                    "commands": [],
+                }
+            )
+            save_mount_metadata(session_info["local_mount_point"], metadata)
 
     def _append_command_metadata(
         self,
@@ -77,21 +114,109 @@ class SessionManager:
         exit_code: int,
         executed_at: str,
     ) -> None:
-        metadata = load_mount_metadata(session_info["local_mount_point"])
-        for item in metadata.get("sessions", []):
-            if item["session_id"] != session_info["session_id"]:
-                continue
-            item.setdefault("commands", []).append(
-                {
+        with state_lock():
+            metadata = load_mount_metadata(session_info["local_mount_point"])
+            for item in metadata.get("sessions", []):
+                if item["session_id"] != session_info["session_id"]:
+                    continue
+                commands = item.setdefault("commands", [])
+                record = {
                     "index": command_index,
                     "cmd": cmd,
                     "log_file": log_filename,
                     "exit_code": exit_code,
                     "executed_at": executed_at,
                 }
-            )
-            save_mount_metadata(session_info["local_mount_point"], metadata)
-            return
+                for index, existing in enumerate(commands):
+                    if existing.get("index") != command_index:
+                        continue
+                    commands[index] = record
+                    save_mount_metadata(session_info["local_mount_point"], metadata)
+                    return
+                commands.append(record)
+                save_mount_metadata(session_info["local_mount_point"], metadata)
+                return
+
+    def _clear_active_command(
+        self,
+        session_id: str,
+        command_index: int,
+        status: str = "active",
+    ) -> Optional[Dict[str, Any]]:
+        with state_lock():
+            state = self._get_state()
+            session_info = state["sessions"].get(session_id)
+            if not session_info:
+                return None
+
+            active_command = session_info.get("active_command") or {}
+            if (
+                not session_info.get("busy")
+                or active_command.get("command_index") != command_index
+            ):
+                return session_info.copy()
+
+            session_info["busy"] = False
+            session_info["status"] = status
+            session_info.pop("active_command", None)
+            state["sessions"][session_id] = session_info
+            save_state(state)
+            return session_info.copy()
+
+    def _complete_active_command(
+        self,
+        session_id: str,
+        exit_code: int,
+        executed_at: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        active_command: Optional[Dict[str, Any]] = None
+        with state_lock():
+            state = self._get_state()
+            session_info = state["sessions"].get(session_id)
+            if not session_info:
+                return None
+
+            active_command = session_info.get("active_command")
+            if not session_info.get("busy") or not active_command:
+                return session_info.copy()
+
+            executed_at = executed_at or get_timestamp()
+            session_info["busy"] = False
+            session_info["status"] = "active"
+            session_info["last_command"] = active_command["cmd"]
+            session_info["last_exit_code"] = exit_code
+            session_info["last_executed_at"] = executed_at
+            session_info.pop("active_command", None)
+            state["sessions"][session_id] = session_info
+            save_state(state)
+            finalized_session = session_info.copy()
+
+        self._append_command_metadata(
+            session_info=finalized_session,
+            command_index=active_command["command_index"],
+            cmd=active_command["cmd"],
+            log_filename=active_command["log_filename"],
+            exit_code=exit_code,
+            executed_at=executed_at,
+        )
+        return finalized_session
+
+    def _refresh_active_command(self, session_id: str) -> Optional[Dict[str, Any]]:
+        state = self._get_state()
+        session_info = state["sessions"].get(session_id)
+        if not session_info or not session_info.get("busy"):
+            return session_info
+
+        active_command = session_info.get("active_command") or {}
+        log_file = active_command.get("local_log_file")
+        if not log_file:
+            return session_info
+
+        exit_code = _read_exit_code(log_file)
+        if exit_code is None:
+            return session_info
+
+        return self._complete_active_command(session_id, exit_code)
 
     def create(
         self,
@@ -148,12 +273,44 @@ class SessionManager:
             "created_at": get_timestamp(),
             "command_count": 0,
             "timeout_seconds": timeout,
+            "busy": False,
         }
 
-        state["sessions"][session_id] = session_info
-        mount.setdefault("session_ids", []).append(session_id)
-        state["mounts"][mount_id] = mount
-        save_state(state)
+        conflict: Optional[Exception] = None
+        with state_lock():
+            state = self._get_state()
+            mount = state["mounts"].get(mount_id)
+            if not mount:
+                conflict = KeyError(f"Mount '{mount_id}' not found")
+            elif mount["status"] != "mounted":
+                conflict = RuntimeError(f"Mount '{mount_id}' is not mounted")
+            elif mount["machine"] != machine_id:
+                conflict = RuntimeError("Session machine does not match mount machine")
+            else:
+                for existing in state["sessions"].values():
+                    if existing["mount_id"] != mount_id:
+                        continue
+                    if existing["session_name"] != session_name:
+                        continue
+                    if existing.get("status") != "destroyed":
+                        conflict = ValueError(f"Session name already in use: {session_name}")
+                        break
+
+            if conflict is None:
+                state["sessions"][session_id] = session_info
+                mount.setdefault("session_ids", []).append(session_id)
+                state["mounts"][mount_id] = mount
+                save_state(state)
+
+        if conflict is not None:
+            run_ssh_command(
+                machine_id,
+                f"tmux kill-session -t {escape_shell_arg(tmux_session)} || true",
+                timeout=10,
+                check=False,
+            )
+            raise conflict
+
         self._update_mount_metadata_session(session_info)
 
         return {
@@ -175,41 +332,76 @@ class SessionManager:
         timeout: int = 300,
     ) -> Dict[str, Any]:
         """Execute a command within a session."""
+        self._refresh_active_command(session_id)
         state = self._get_state()
         if session_id not in state["sessions"]:
             raise KeyError(f"Session '{session_id}' not found")
 
         session_info = state["sessions"][session_id]
-        computed_status = self._compute_status(session_info)
+        mount = state["mounts"].get(session_info["mount_id"])
+        computed_status = self._compute_status(session_info, mount)
         if computed_status == "destroyed":
             raise RuntimeError(f"Session '{session_id}' has been destroyed")
         if computed_status == "timeout":
-            session_info["status"] = "timeout"
-            state["sessions"][session_id] = session_info
-            save_state(state)
             raise RuntimeError(f"Session '{session_id}' has timed out")
+        if computed_status == "busy":
+            raise RuntimeError(self._busy_error(session_info))
         if computed_status == "error":
             raise RuntimeError(f"Session '{session_id}' is not active")
 
-        mount = state["mounts"].get(session_info["mount_id"])
         if not mount or mount.get("status") != "mounted":
             raise RuntimeError(f"Mount '{session_info['mount_id']}' is not mounted")
 
-        session_name = session_info["session_name"]
-        local_mount_point = session_info["local_mount_point"]
-        remote_work_dir = session_info["remote_work_dir"]
-        tmux_session = session_info["tmux_session"]
+        with state_lock():
+            state = self._get_state()
+            if session_id not in state["sessions"]:
+                raise KeyError(f"Session '{session_id}' not found")
 
-        session_info["command_count"] += 1
-        command_index = session_info["command_count"]
-        log_filename = f"cmd_{command_index:03d}.log"
+            session_info = state["sessions"][session_id]
+            mount = state["mounts"].get(session_info["mount_id"])
+            if session_info.get("status") == "destroyed":
+                raise RuntimeError(f"Session '{session_id}' has been destroyed")
 
-        local_log_dir = os.path.join(local_mount_point, "logs", session_name)
+            created_at = parse_timestamp(session_info["created_at"])
+            elapsed_seconds = int((_now_utc() - created_at).total_seconds())
+            if elapsed_seconds > session_info["timeout_seconds"]:
+                session_info["status"] = "timeout"
+                state["sessions"][session_id] = session_info
+                save_state(state)
+                raise RuntimeError(f"Session '{session_id}' has timed out")
+
+            if session_info.get("busy"):
+                raise RuntimeError(self._busy_error(session_info))
+            if not mount or mount.get("status") != "mounted":
+                raise RuntimeError(f"Mount '{session_info['mount_id']}' is not mounted")
+
+            session_name = session_info["session_name"]
+            local_mount_point = session_info["local_mount_point"]
+            remote_work_dir = session_info["remote_work_dir"]
+            tmux_session = session_info["tmux_session"]
+
+            command_index = session_info.get("command_count", 0) + 1
+            log_filename = f"cmd_{command_index:03d}.log"
+            local_log_dir = os.path.join(local_mount_point, "logs", session_name)
+            local_log_file = os.path.join(local_log_dir, log_filename)
+            remote_log_dir = os.path.join(remote_work_dir, "logs", session_name)
+            remote_log_file = os.path.join(remote_log_dir, log_filename)
+
+            session_info["command_count"] = command_index
+            session_info["busy"] = True
+            session_info["status"] = "busy"
+            session_info["active_command"] = {
+                "command_index": command_index,
+                "cmd": cmd,
+                "log_filename": log_filename,
+                "local_log_file": local_log_file,
+                "remote_log_file": remote_log_file,
+                "started_at": get_timestamp(),
+            }
+            state["sessions"][session_id] = session_info
+            save_state(state)
+
         ensure_dir(local_log_dir)
-        local_log_file = os.path.join(local_log_dir, log_filename)
-
-        remote_log_dir = os.path.join(remote_work_dir, "logs", session_name)
-        remote_log_file = os.path.join(remote_log_dir, log_filename)
 
         script = "\n".join(
             [
@@ -240,49 +432,47 @@ class SessionManager:
         )
 
         start_time = time.time()
-        execute_ssh_command(session_info["machine"], remote_cmd, timeout=timeout)
+        try:
+            execute_ssh_command(session_info["machine"], remote_cmd, timeout=timeout)
+        except Exception:
+            self._clear_active_command(session_id, command_index)
+            raise
 
         exit_code: Optional[int] = None
         while time.time() - start_time < timeout:
-            if os.path.exists(local_log_file):
-                log_content = read_file(local_log_file)
-                if "exit_code:" in log_content:
-                    for line in reversed(log_content.strip().splitlines()):
-                        if "exit_code:" not in line:
-                            continue
-                        try:
-                            exit_code = int(line.split("exit_code:")[-1].strip())
-                            break
-                        except ValueError:
-                            continue
-                    if exit_code is not None:
-                        break
+            exit_code = _read_exit_code(local_log_file)
+            if exit_code is not None:
+                break
             time.sleep(0.5)
 
+        finalized_session: Optional[Dict[str, Any]] = None
         if exit_code is None:
-            raise RuntimeError(f"Command execution timeout after {timeout} seconds")
+            refreshed = self._refresh_active_command(session_id)
+            if refreshed and not refreshed.get("busy"):
+                finalized_session = refreshed
+                exit_code = refreshed.get("last_exit_code")
+            else:
+                raise RuntimeError(
+                    f"Command execution timeout after {timeout} seconds; "
+                    "session remains busy until command exits"
+                )
+        else:
+            finalized_session = self._complete_active_command(
+                session_id,
+                exit_code,
+                get_timestamp(),
+            )
 
-        executed_at = get_timestamp()
-        duration_ms = int((time.time() - start_time) * 1000)
-
-        session_info["status"] = "active"
-        session_info["last_command"] = cmd
-        session_info["last_exit_code"] = exit_code
-        session_info["last_executed_at"] = executed_at
-        state["sessions"][session_id] = session_info
-        save_state(state)
-        self._append_command_metadata(
-            session_info=session_info,
-            command_index=command_index,
-            cmd=cmd,
-            log_filename=log_filename,
-            exit_code=exit_code,
-            executed_at=executed_at,
+        executed_at = (
+            finalized_session.get("last_executed_at")
+            if finalized_session
+            else get_timestamp()
         )
+        duration_ms = int((time.time() - start_time) * 1000)
 
         return {
             "session_id": session_id,
-            "session_name": session_name,
+            "session_name": session_info["session_name"],
             "command": cmd,
             "exit_code": exit_code,
             "log_file_local": local_log_file,
@@ -294,14 +484,14 @@ class SessionManager:
 
     def status(self, session_id: str) -> Dict[str, Any]:
         """Get session status."""
+        self._refresh_active_command(session_id)
         state = self._get_state()
         if session_id not in state["sessions"]:
             raise KeyError(f"Session '{session_id}' not found")
 
-        session_info = state["sessions"][session_id]
-        session_info["status"] = self._compute_status(session_info)
-        state["sessions"][session_id] = session_info
-        save_state(state)
+        session_info = state["sessions"][session_id].copy()
+        mount = state["mounts"].get(session_info["mount_id"])
+        session_info["status"] = self._compute_status(session_info, mount)
 
         created_at = parse_timestamp(session_info["created_at"])
         elapsed_seconds = int((_now_utc() - created_at).total_seconds())
@@ -312,6 +502,7 @@ class SessionManager:
 
     def destroy(self, session_id: str) -> Dict[str, Any]:
         """Destroy a session while preserving logs."""
+        self._refresh_active_command(session_id)
         state = self._get_state()
         if session_id not in state["sessions"]:
             raise KeyError(f"Session '{session_id}' not found")
@@ -330,18 +521,26 @@ class SessionManager:
             "logs",
             session_info["session_name"],
         )
-        session_info["status"] = "destroyed"
-        session_info["destroyed_at"] = get_timestamp()
-        session_info["logs_preserved"] = True
-        session_info["logs_location"] = logs_location
-        state["sessions"][session_id] = session_info
-        save_state(state)
+        destroyed_at = get_timestamp()
+        with state_lock():
+            state = self._get_state()
+            if session_id not in state["sessions"]:
+                raise KeyError(f"Session '{session_id}' not found")
+            session_info = state["sessions"][session_id]
+            session_info["status"] = "destroyed"
+            session_info["destroyed_at"] = destroyed_at
+            session_info["logs_preserved"] = True
+            session_info["logs_location"] = logs_location
+            session_info["busy"] = False
+            session_info.pop("active_command", None)
+            state["sessions"][session_id] = session_info
+            save_state(state)
 
         return {
             "session_id": session_id,
             "session_name": session_info["session_name"],
             "status": "destroyed",
-            "destroyed_at": session_info["destroyed_at"],
+            "destroyed_at": destroyed_at,
             "logs_preserved": True,
             "logs_location": logs_location,
         }

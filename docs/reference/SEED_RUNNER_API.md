@@ -70,6 +70,7 @@ seed-runner mount create \
 - `--machine` (必需) — 目标机器的标识符，对应 SSH 配置中的 host
 - `--local-dir` (必需) — 本地共享目录路径（将被远程 VM 通过 sshfs 挂载）
 - `--remote-dir` (可选) — 远程 VM 中的实验目录路径，默认 `~/seed-experiment`
+- 如果默认路径与另一项仍在运行的实验冲突，可以显式指定唯一目录，例如 `/home/seed/seed-experiments/ARP_lab`
 - `--timeout` (可选) — 挂载操作的超时时间，单位秒，默认 30
 
 **返回值**（JSON）：
@@ -273,7 +274,8 @@ seed-runner session exec \
 **错误处理**：
 - Session 不存在 → 返回错误
 - Session 已销毁 → 返回错误
-- 命令执行超时 → 返回超时错误，但 session 保持 active（可继续执行）
+- 同一个 session 上存在未结束的命令 → 返回 busy 错误，不接受新的并发 exec
+- 命令执行超时 → 返回超时错误；如果远端命令仍在运行，session 保持 busy，直到该命令真正结束
 - 命令执行失败（exit code != 0） → 返回失败状态，session 保持 active
 
 ---
@@ -310,6 +312,7 @@ seed-runner session status --session <session-id>
 
 **状态值**：
 - `active` — session 正常运行
+- `busy` — session 中已有命令正在运行，暂不接受新的 exec
 - `timeout` — session 已超时
 - `error` — session 出现错误
 - `destroyed` — session 已销毁
@@ -613,8 +616,14 @@ $ seed-runner session exec \
 
 ### 超时处理
 
-- 单条命令超时：返回超时错误，但 session 保持 active
+- 单条命令超时：返回超时错误；如果命令仍在运行，session 保持 `busy`，直到日志中出现最终 exit code
 - 整个 session 超时：标记 session 状态为 `timeout`，后续命令返回错误
+
+### 并发执行约束
+
+- 同一个 session 同时只允许一个前台命令执行
+- `seed-runner` 在命令开始和结束时短暂锁定 `state.json`，避免并发 CLI 进程互相覆盖状态
+- 如果同一 session 上有命令尚未结束，新的 `session exec` 会直接返回 busy 错误，而不是静默排队
 
 ### 网络中断恢复
 

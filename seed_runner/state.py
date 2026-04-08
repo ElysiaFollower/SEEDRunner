@@ -1,10 +1,20 @@
 """Persistent state helpers for mount and session metadata."""
 
+from contextlib import contextmanager
+import fcntl
 import json
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Iterator
 
 from seed_runner.utils import ensure_dir, read_file, write_file
+
+
+def _empty_state() -> Dict[str, Any]:
+    """Return the default persisted state structure."""
+    return {
+        "mounts": {},
+        "sessions": {},
+    }
 
 
 def get_state_dir() -> str:
@@ -20,15 +30,34 @@ def get_state_file() -> str:
     return os.path.join(get_state_dir(), "state.json")
 
 
+def get_state_lock_file() -> str:
+    """Return the lock file guarding state.json mutations."""
+    return os.path.join(get_state_dir(), "state.lock")
+
+
+@contextmanager
+def state_lock() -> Iterator[None]:
+    """Acquire an exclusive cross-process lock for short state mutations."""
+    lock_file = get_state_lock_file()
+    ensure_dir(os.path.dirname(lock_file))
+    fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def load_state() -> Dict[str, Any]:
     """Load persisted state, returning an empty structure when absent."""
     state_file = get_state_file()
     if not os.path.exists(state_file):
-        return {
-            "mounts": {},
-            "sessions": {},
-        }
-    return json.loads(read_file(state_file))
+        return _empty_state()
+    state = json.loads(read_file(state_file))
+    state.setdefault("mounts", {})
+    state.setdefault("sessions", {})
+    return state
 
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -36,6 +65,8 @@ def save_state(state: Dict[str, Any]) -> None:
     state_file = get_state_file()
     ensure_dir(os.path.dirname(state_file))
     temp_file = f"{state_file}.tmp"
+    state.setdefault("mounts", {})
+    state.setdefault("sessions", {})
     write_file(temp_file, json.dumps(state, indent=2, sort_keys=True))
     os.replace(temp_file, state_file)
 

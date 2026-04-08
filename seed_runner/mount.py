@@ -3,10 +3,10 @@
 import getpass
 import os
 import socket
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 from seed_runner.remote import execute_ssh_command, run_ssh_command
-from seed_runner.state import load_state, save_mount_metadata, save_state
+from seed_runner.state import load_state, save_mount_metadata, save_state, state_lock
 from seed_runner.utils import ensure_dir, escape_shell_arg, generate_id, get_timestamp
 
 
@@ -63,10 +63,50 @@ class MountManager:
             raise KeyError(f"Mount '{mount_id}' not found")
         return state["mounts"][mount_id]
 
+    def _remote_mount_source(self, machine_id: str, remote_path: str) -> Optional[str]:
+        """Return the current remote mount source when the path is already mounted."""
+        quoted_path = escape_shell_arg(remote_path)
+        mounted = run_ssh_command(
+            machine_id,
+            f"mountpoint -q {quoted_path}",
+            timeout=10,
+            check=False,
+        )
+        if mounted.returncode != 0:
+            return None
+
+        source = run_ssh_command(
+            machine_id,
+            f"findmnt -n -o SOURCE --target {quoted_path}",
+            timeout=10,
+            check=False,
+        )
+        value = source.stdout.strip()
+        return value or None
+
     def _save_mount(self, mount_info: Dict[str, Any]) -> None:
-        state = load_state()
-        state["mounts"][mount_info["mount_id"]] = mount_info
-        save_state(state)
+        with state_lock():
+            state = load_state()
+            state["mounts"][mount_info["mount_id"]] = mount_info
+            save_state(state)
+
+    def _tmux_sessions_using_path(self, machine_id: str, remote_path: str) -> Set[str]:
+        """Discover tmux sessions whose panes currently live under the remote path."""
+        result = run_ssh_command(
+            machine_id,
+            "tmux list-panes -a -F '#{session_name}\t#{pane_current_path}' 2>/dev/null || true",
+            timeout=10,
+            check=False,
+        )
+        sessions: Set[str] = set()
+        for line in result.stdout.splitlines():
+            if "\t" not in line:
+                continue
+            session_name, pane_path = line.split("\t", 1)
+            pane_path = pane_path.strip()
+            if pane_path == remote_path or pane_path.startswith(f"{remote_path}/"):
+                sessions.add(session_name.strip())
+        return sessions
 
     def _session_count(self, mount_info: Dict[str, Any]) -> int:
         return len(mount_info.get("session_ids", []))
@@ -97,6 +137,7 @@ class MountManager:
         local_user = self.local_user or os.getenv("SEED_RUNNER_LOCAL_USER") or getpass.getuser()
         local_ssh_port = self.local_ssh_port or int(os.getenv("SEED_RUNNER_LOCAL_SSH_PORT", "22"))
         local_host = self._discover_local_host()
+        expected_source = f"{local_user}@{local_host}:{local_path}"
         remote_key = (
             self.remote_to_local_key
             or os.getenv("SEED_RUNNER_REMOTE_TO_LOCAL_KEY")
@@ -116,28 +157,39 @@ class MountManager:
         ensure_dir(os.path.join(local_path, "logs"))
         ensure_dir(os.path.join(local_path, "artifacts"))
 
-        execute_ssh_command(
-            machine_id,
-            f"mkdir -p {escape_shell_arg(remote_path)}",
-            timeout=timeout,
-        )
+        reused_existing_mount = False
+        existing_source = self._remote_mount_source(machine_id, remote_path)
+        if existing_source:
+            if existing_source == expected_source:
+                reused_existing_mount = True
+            else:
+                raise RuntimeError(
+                    "Remote mount point already in use: "
+                    f"{remote_path} is mounted from {existing_source}"
+                )
+        else:
+            execute_ssh_command(
+                machine_id,
+                f"mkdir -p {escape_shell_arg(remote_path)}",
+                timeout=timeout,
+            )
 
-        source = escape_shell_arg(f"{local_user}@{local_host}:{local_path}")
-        mount_point = escape_shell_arg(remote_path)
-        mount_cmd = (
-            f"sshfs -o reconnect,nonempty,StrictHostKeyChecking=no,IdentityFile={remote_key} "
-            f"-p {local_ssh_port} {source} {mount_point}"
-        )
-        execute_ssh_command(machine_id, mount_cmd, timeout=timeout)
+            source = escape_shell_arg(expected_source)
+            mount_point = escape_shell_arg(remote_path)
+            mount_cmd = (
+                f"sshfs -o reconnect,nonempty,StrictHostKeyChecking=no,IdentityFile={remote_key} "
+                f"-p {local_ssh_port} {source} {mount_point}"
+            )
+            execute_ssh_command(machine_id, mount_cmd, timeout=timeout)
 
-        verify = run_ssh_command(
-            machine_id,
-            f"mountpoint -q {escape_shell_arg(remote_path)}",
-            timeout=timeout,
-            check=False,
-        )
-        if verify.returncode != 0:
-            raise RuntimeError(f"Remote mount did not become ready: {verify.stderr}")
+            verify = run_ssh_command(
+                machine_id,
+                f"mountpoint -q {escape_shell_arg(remote_path)}",
+                timeout=timeout,
+                check=False,
+            )
+            if verify.returncode != 0:
+                raise RuntimeError(f"Remote mount did not become ready: {verify.stderr}")
 
         mount_id = generate_id("mnt")
         mounted_at = get_timestamp()
@@ -175,7 +227,7 @@ class MountManager:
         if mount_id not in state["mounts"]:
             raise KeyError(f"Mount '{mount_id}' not found")
 
-        mount_info = state["mounts"][mount_id]
+        mount_info = state["mounts"][mount_id].copy()
         if mount_info["status"] != "unmounted":
             verify = run_ssh_command(
                 mount_info["machine"],
@@ -184,8 +236,6 @@ class MountManager:
                 check=False,
             )
             mount_info["status"] = "mounted" if verify.returncode == 0 else "error"
-            state["mounts"][mount_id] = mount_info
-            save_state(state)
 
         result = self._public_mount_info(mount_info)
         result["session_count"] = self._session_count(mount_info)
@@ -202,21 +252,21 @@ class MountManager:
         remote_path = mount_info["remote_path"]
         machine_id = mount_info["machine"]
 
+        tmux_sessions_to_kill: Set[str] = set()
         for session_id in mount_info.get("session_ids", []):
             session = state["sessions"].get(session_id)
             if not session or session.get("status") == "destroyed":
                 continue
+            tmux_sessions_to_kill.add(session["tmux_session"])
+
+        tmux_sessions_to_kill.update(self._tmux_sessions_using_path(machine_id, remote_path))
+        for tmux_session in sorted(tmux_sessions_to_kill):
             run_ssh_command(
                 machine_id,
-                f"tmux kill-session -t {escape_shell_arg(session['tmux_session'])} || true",
+                f"tmux kill-session -t {escape_shell_arg(tmux_session)} || true",
                 timeout=10,
                 check=False,
             )
-            session["status"] = "destroyed"
-            session["destroyed_at"] = get_timestamp()
-            session["logs_preserved"] = True
-            session["logs_location"] = os.path.join(local_path, "logs", session["session_name"])
-            state["sessions"][session_id] = session
 
         run_ssh_command(
             machine_id,
@@ -237,15 +287,44 @@ class MountManager:
                 check=False,
             )
 
-        mount_info["status"] = "unmounted"
-        mount_info["unmounted_at"] = get_timestamp()
-        state["mounts"][mount_id] = mount_info
-        save_state(state)
+        verify = run_ssh_command(
+            machine_id,
+            f"mountpoint -q {escape_shell_arg(remote_path)}",
+            timeout=10,
+            check=False,
+        )
+        if verify.returncode == 0:
+            raise RuntimeError(f"Remote mount is still active: {remote_path}")
+
+        unmounted_at = get_timestamp()
+        with state_lock():
+            state = load_state()
+            if mount_id not in state["mounts"]:
+                raise KeyError(f"Mount '{mount_id}' not found")
+
+            mount_info = state["mounts"][mount_id]
+            mount_info["status"] = "unmounted"
+            mount_info["unmounted_at"] = unmounted_at
+            state["mounts"][mount_id] = mount_info
+
+            for session_id in mount_info.get("session_ids", []):
+                session = state["sessions"].get(session_id)
+                if not session or session.get("status") == "destroyed":
+                    continue
+                session["status"] = "destroyed"
+                session["destroyed_at"] = unmounted_at
+                session["logs_preserved"] = True
+                session["logs_location"] = os.path.join(local_path, "logs", session["session_name"])
+                session["busy"] = False
+                session.pop("active_command", None)
+                state["sessions"][session_id] = session
+
+            save_state(state)
 
         return {
             "mount_id": mount_id,
             "status": "unmounted",
-            "unmounted_at": mount_info["unmounted_at"],
+            "unmounted_at": unmounted_at,
             "artifacts_preserved": True,
             "artifacts_location": local_path,
         }

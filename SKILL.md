@@ -39,6 +39,16 @@ Do not use this skill to modify or debug the `seed-runner` implementation itself
 seed-runner mount create --machine <machine-id> --local-dir ./artifacts
 ```
 
+If the default remote mount point is occupied by another experiment, retry with
+an explicit per-experiment path such as:
+
+```bash
+seed-runner mount create \
+  --machine <machine-id> \
+  --local-dir ./artifacts \
+  --remote-dir /home/seed/seed-experiments/<experiment-name>
+```
+
 5. Create a session with a descriptive name:
 
 ```bash
@@ -73,7 +83,9 @@ seed-runner session exec --session <session-id> --cmd "<shell-command>"
 ## Failure Handling
 
 - If `mount create` fails, treat it as an environment blocker. Surface the exact JSON error and stop. Do not silently fall back to raw SSH.
+- If `mount create` fails because the default remote path is already occupied by another experiment, it is acceptable to retry once with a unique `--remote-dir` such as `/home/seed/seed-experiments/<experiment-name>`.
 - If `session create` fails, report the exact error and stop.
+- If `session exec` reports that the session is busy, do not assume platform failure. Wait for the current command to finish or inspect its log/status before retrying.
 - If `seed-runner session exec` returns a non-zero `exit_code`, this is usually a task-level failure, not a platform failure. Read the log, diagnose, and retry strategically.
 - If a command times out, inspect the partial log first. Then either increase `--timeout`, split the work into smaller commands, or report the blocker.
 - If a session is gone or a mount is unmounted, recreate what you need instead of assuming hidden state still exists.

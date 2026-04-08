@@ -6,6 +6,7 @@ a unified interface for accessing SSH connection details.
 """
 
 import os
+from pathlib import Path
 from typing import Dict, Optional
 from dataclasses import dataclass
 
@@ -45,7 +46,7 @@ class ConfigManager:
         Args:
             env_file: Path to .env.machines file
         """
-        self.env_file = env_file
+        self.env_file = resolve_env_file(env_file)
         self.machines: Dict[str, MachineConfig] = {}
         self._load_config()
 
@@ -147,6 +148,27 @@ class ConfigManager:
     def has_machine(self, machine_id: str) -> bool:
         """Check if a machine is configured."""
         return machine_id in self.machines
+
+
+def _get_project_root() -> Path:
+    """Return the repository root when running from the editable project."""
+    return Path(__file__).resolve().parent.parent
+
+
+def resolve_env_file(env_file: str = ".env.machines") -> str:
+    """Resolve the default config file from workspace or project root."""
+    requested = Path(os.path.expanduser(env_file))
+    if requested.is_absolute():
+        return str(requested)
+
+    cwd = Path.cwd().resolve()
+    for parent in (cwd, *cwd.parents):
+        candidate = parent / requested
+        if candidate.exists():
+            return str(candidate)
+
+    project_candidate = _get_project_root() / requested
+    return str(project_candidate)
 
 
 # Global config manager instance
