@@ -51,7 +51,12 @@ cp .env.machines.example .env.machines
 # MACHINE_vm-seed-01_KEY=<PATH_TO_KEY>
 ```
 
-`seed-runner` now mounts the local shared directory on the remote VM via `sshfs`.
+`seed-runner` uses `sshfs` as an internal sync channel from the remote VM back
+to your local shared directory. Agents should not need to reason about the
+mounted path directly: the intended model is that commands run in a normal
+remote working directory on local disk, while logs and artifacts are synced
+through the shared directory.
+
 That means the target VM must be able to SSH back to your local machine using
 `SEED_RUNNER_LOCAL_HOST` and `SEED_RUNNER_LOCAL_SSH_PORT`. If the return path
 needs a different local username or key path, set `SEED_RUNNER_LOCAL_USER` and

@@ -2,6 +2,7 @@
 
 import getpass
 import os
+import posixpath
 import socket
 from typing import Any, Dict, Optional, Set
 
@@ -133,11 +134,14 @@ class MountManager:
 
         machine_config = get_machine_config(machine_id)
         local_path = os.path.abspath(local_dir)
+        local_workspace_root = os.path.dirname(local_path)
         remote_path = _normalize_remote_dir(machine_config.user, remote_dir)
+        mount_id = generate_id("mnt")
+        remote_sync_dir = f"/home/{machine_config.user}/.seed-runner/mounts/{mount_id}/sync"
         local_user = self.local_user or os.getenv("SEED_RUNNER_LOCAL_USER") or getpass.getuser()
         local_ssh_port = self.local_ssh_port or int(os.getenv("SEED_RUNNER_LOCAL_SSH_PORT", "22"))
         local_host = self._discover_local_host()
-        expected_source = f"{local_user}@{local_host}:{local_path}"
+        expected_source = f"{local_user}@{local_host}:{local_workspace_root}"
         remote_key = (
             self.remote_to_local_key
             or os.getenv("SEED_RUNNER_REMOTE_TO_LOCAL_KEY")
@@ -158,24 +162,28 @@ class MountManager:
         ensure_dir(os.path.join(local_path, "artifacts"))
 
         reused_existing_mount = False
-        existing_source = self._remote_mount_source(machine_id, remote_path)
+        existing_source = self._remote_mount_source(machine_id, remote_sync_dir)
         if existing_source:
             if existing_source == expected_source:
                 reused_existing_mount = True
             else:
                 raise RuntimeError(
                     "Remote mount point already in use: "
-                    f"{remote_path} is mounted from {existing_source}"
+                    f"{remote_sync_dir} is mounted from {existing_source}"
                 )
         else:
             execute_ssh_command(
                 machine_id,
-                f"mkdir -p {escape_shell_arg(remote_path)}",
+                (
+                    f"mkdir -p {escape_shell_arg(remote_sync_dir)} "
+                    f"{escape_shell_arg(remote_path)} "
+                    f"{escape_shell_arg(posixpath.join(remote_sync_dir, 'artifacts'))}"
+                ),
                 timeout=timeout,
             )
 
             source = escape_shell_arg(expected_source)
-            mount_point = escape_shell_arg(remote_path)
+            mount_point = escape_shell_arg(remote_sync_dir)
             mount_cmd = (
                 f"sshfs -o reconnect,nonempty,StrictHostKeyChecking=no,IdentityFile={remote_key} "
                 f"-p {local_ssh_port} {source} {mount_point}"
@@ -184,20 +192,21 @@ class MountManager:
 
             verify = run_ssh_command(
                 machine_id,
-                f"mountpoint -q {escape_shell_arg(remote_path)}",
+                f"mountpoint -q {escape_shell_arg(remote_sync_dir)}",
                 timeout=timeout,
                 check=False,
             )
             if verify.returncode != 0:
                 raise RuntimeError(f"Remote mount did not become ready: {verify.stderr}")
 
-        mount_id = generate_id("mnt")
         mounted_at = get_timestamp()
         mount_info = {
             "mount_id": mount_id,
             "machine": machine_id,
             "local_path": local_path,
+            "local_workspace_root": local_workspace_root,
             "remote_path": remote_path,
+            "remote_sync_dir": remote_sync_dir,
             "local_host": local_host,
             "local_user": local_user,
             "local_ssh_port": local_ssh_port,
@@ -214,7 +223,9 @@ class MountManager:
                 "mount_id": mount_id,
                 "machine": machine_id,
                 "local_path": local_path,
+                "local_workspace_root": local_workspace_root,
                 "remote_path": remote_path,
+                "remote_sync_dir": remote_sync_dir,
                 "mounted_at": mounted_at,
                 "sessions": [],
             },
@@ -231,7 +242,7 @@ class MountManager:
         if mount_info["status"] != "unmounted":
             verify = run_ssh_command(
                 mount_info["machine"],
-                f"mountpoint -q {escape_shell_arg(mount_info['remote_path'])}",
+                f"mountpoint -q {escape_shell_arg(mount_info['remote_sync_dir'])}",
                 timeout=10,
                 check=False,
             )
@@ -250,6 +261,7 @@ class MountManager:
         mount_info = state["mounts"][mount_id]
         local_path = mount_info["local_path"]
         remote_path = mount_info["remote_path"]
+        remote_sync_dir = mount_info["remote_sync_dir"]
         machine_id = mount_info["machine"]
 
         tmux_sessions_to_kill: Set[str] = set()
@@ -260,6 +272,7 @@ class MountManager:
             tmux_sessions_to_kill.add(session["tmux_session"])
 
         tmux_sessions_to_kill.update(self._tmux_sessions_using_path(machine_id, remote_path))
+        tmux_sessions_to_kill.update(self._tmux_sessions_using_path(machine_id, remote_sync_dir))
         for tmux_session in sorted(tmux_sessions_to_kill):
             run_ssh_command(
                 machine_id,
@@ -271,9 +284,9 @@ class MountManager:
         run_ssh_command(
             machine_id,
             (
-                f"fusermount -u {escape_shell_arg(remote_path)} || "
-                f"umount {escape_shell_arg(remote_path)} || "
-                f"umount -f {escape_shell_arg(remote_path)} || true"
+                f"fusermount -u {escape_shell_arg(remote_sync_dir)} || "
+                f"umount {escape_shell_arg(remote_sync_dir)} || "
+                f"umount -f {escape_shell_arg(remote_sync_dir)} || true"
             ),
             timeout=30,
             check=False,
@@ -282,19 +295,19 @@ class MountManager:
         if cleanup:
             run_ssh_command(
                 machine_id,
-                f"rm -rf {escape_shell_arg(remote_path)}",
+                f"rm -rf {escape_shell_arg(remote_sync_dir)} {escape_shell_arg(remote_path)}",
                 timeout=30,
                 check=False,
             )
 
         verify = run_ssh_command(
             machine_id,
-            f"mountpoint -q {escape_shell_arg(remote_path)}",
+            f"mountpoint -q {escape_shell_arg(remote_sync_dir)}",
             timeout=10,
             check=False,
         )
         if verify.returncode == 0:
-            raise RuntimeError(f"Remote mount is still active: {remote_path}")
+            raise RuntimeError(f"Remote mount is still active: {remote_sync_dir}")
 
         unmounted_at = get_timestamp()
         with state_lock():

@@ -27,6 +27,7 @@ Do not use this skill to modify or debug the `seed-runner` implementation itself
 - Unless the user says otherwise, create and use a dedicated workspace under `runs/<experiment-name>/` and do not run experiments from the repository root.
 - Treat this skill as a complete end-to-end workflow: understand the lab, execute it, verify the result, write the report, and clean up in one pass.
 - Do not assume a human is supervising between steps or will manually stitch together partial outputs for you.
+- Treat `remote_work_dir` as the real remote working directory on local disk, not as an sshfs mount path you need to reason about.
 
 ## Standard Workflow
 
@@ -75,6 +76,7 @@ seed-runner session exec --session <session-id> --cmd "<shell-command>"
 - Send complete shell commands, not partial fragments.
 - Prefer non-interactive commands.
 - Use relative paths inside the remote work directory unless there is a clear reason not to.
+- Assume `seed-runner` handles sync/staging before command execution. You should operate on the returned `remote_work_dir` as if it were a normal remote directory.
 - If a task is long-running, set a larger `--timeout` instead of assuming the default is enough.
 - If you need durable evidence, write it under `artifacts/` so it lands in the local shared directory.
 - Keep notes, reports, and intermediate files inside the current `runs/<experiment-name>/` workspace so the tool repository stays clean.
@@ -125,6 +127,7 @@ Keep the loop tight. Do not queue many blind commands before reading the evidenc
 ## Notes
 
 - `seed-runner` already handles the remote working directory and log placement. Use the returned paths instead of guessing.
+- The sync directory is an internal detail. The only remote path the agent should rely on is `remote_work_dir`.
 - Logs are the primary source of truth for command behavior.
 - Artifacts in the local shared directory are the primary source of truth for produced files.
 - `runs/SKILL.md` is an auxiliary writing guide for report polish, not the primary execution workflow.

@@ -1,6 +1,7 @@
 """Session management for seed-runner."""
 
 import os
+import posixpath
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -35,6 +36,62 @@ def _read_exit_code(log_file: str) -> Optional[int]:
 
 class SessionManager:
     """Manage tmux-backed remote execution sessions."""
+
+    def _sync_inputs_command(self, remote_sync_dir: str, remote_work_dir: str) -> str:
+        quoted_sync_dir = escape_shell_arg(remote_sync_dir)
+        quoted_work_dir = escape_shell_arg(remote_work_dir)
+        return "\n".join(
+            [
+                f"mkdir -p {quoted_work_dir}",
+                "if command -v rsync >/dev/null 2>&1; then",
+                f"  rsync -a --delete --exclude 'artifacts/' {quoted_sync_dir}/ {quoted_work_dir}/",
+                "else",
+                (
+                    f"  find {quoted_work_dir} -mindepth 1 -maxdepth 1 "
+                    "! -name artifacts ! -name logs -exec rm -rf {} +"
+                ),
+                (
+                    f"  cd {quoted_sync_dir} && tar --exclude='./artifacts' -cf - . | "
+                    f"(cd {quoted_work_dir} && tar -xf -)"
+                ),
+                "fi",
+                f"mkdir -p {escape_shell_arg(posixpath.join(remote_work_dir, 'artifacts'))}",
+                f"mkdir -p {escape_shell_arg(posixpath.join(remote_work_dir, 'logs'))}",
+            ]
+        )
+
+    def _sync_outputs_command(self, remote_work_dir: str, remote_sync_dir: str) -> str:
+        sync_artifacts_dir = posixpath.join(remote_sync_dir, "artifacts")
+        work_artifacts_dir = posixpath.join(remote_work_dir, "artifacts")
+        work_logs_dir = posixpath.join(remote_work_dir, "logs")
+        return "\n".join(
+            [
+                f"mkdir -p {escape_shell_arg(sync_artifacts_dir)}",
+                "if command -v rsync >/dev/null 2>&1; then",
+                (
+                    f"  rsync -a {escape_shell_arg(work_logs_dir)}/ "
+                    f"{escape_shell_arg(posixpath.join(sync_artifacts_dir, 'logs'))}/"
+                ),
+                (
+                    f"  rsync -a {escape_shell_arg(work_artifacts_dir)}/ "
+                    f"{escape_shell_arg(posixpath.join(sync_artifacts_dir, 'artifacts'))}/"
+                ),
+                "else",
+                (
+                    f"  mkdir -p {escape_shell_arg(posixpath.join(sync_artifacts_dir, 'logs'))} "
+                    f"{escape_shell_arg(posixpath.join(sync_artifacts_dir, 'artifacts'))}"
+                ),
+                (
+                    f"  cp -a {escape_shell_arg(work_logs_dir)}/. "
+                    f"{escape_shell_arg(posixpath.join(sync_artifacts_dir, 'logs'))}/ 2>/dev/null || true"
+                ),
+                (
+                    f"  cp -a {escape_shell_arg(work_artifacts_dir)}/. "
+                    f"{escape_shell_arg(posixpath.join(sync_artifacts_dir, 'artifacts'))}/ 2>/dev/null || true"
+                ),
+                "fi",
+            ]
+        )
 
     def _get_state(self) -> Dict[str, Any]:
         return load_state()
@@ -247,6 +304,7 @@ class SessionManager:
         tmux_session = f"seed_{session_id}"
         local_mount_point = mount["local_path"]
         remote_work_dir = mount["remote_path"]
+        remote_sync_dir = mount["remote_sync_dir"]
 
         ensure_dir(os.path.join(local_mount_point, "logs", session_name))
 
@@ -254,7 +312,8 @@ class SessionManager:
             machine_id,
             (
                 f"mkdir -p {escape_shell_arg(os.path.join(remote_work_dir, 'logs', session_name))} "
-                f"{escape_shell_arg(os.path.join(remote_work_dir, 'artifacts'))} && "
+                f"{escape_shell_arg(os.path.join(remote_work_dir, 'artifacts'))} "
+                f"{escape_shell_arg(posixpath.join(remote_sync_dir, 'artifacts', 'logs', session_name))} && "
                 f"tmux new-session -d -s {escape_shell_arg(tmux_session)} "
                 f"-c {escape_shell_arg(remote_work_dir)}"
             ),
@@ -378,13 +437,14 @@ class SessionManager:
             session_name = session_info["session_name"]
             local_mount_point = session_info["local_mount_point"]
             remote_work_dir = session_info["remote_work_dir"]
+            remote_sync_dir = mount["remote_sync_dir"]
             tmux_session = session_info["tmux_session"]
 
             command_index = session_info.get("command_count", 0) + 1
             log_filename = f"cmd_{command_index:03d}.log"
             local_log_dir = os.path.join(local_mount_point, "logs", session_name)
             local_log_file = os.path.join(local_log_dir, log_filename)
-            remote_log_dir = os.path.join(remote_work_dir, "logs", session_name)
+            remote_log_dir = posixpath.join(remote_sync_dir, "artifacts", "logs", session_name)
             remote_log_file = os.path.join(remote_log_dir, log_filename)
 
             session_info["command_count"] = command_index
@@ -405,6 +465,7 @@ class SessionManager:
 
         script = "\n".join(
             [
+                self._sync_inputs_command(remote_sync_dir, remote_work_dir),
                 f"mkdir -p {escape_shell_arg(remote_log_dir)}",
                 f"cd {escape_shell_arg(remote_work_dir)}",
                 (
@@ -414,6 +475,7 @@ class SessionManager:
                 ),
                 f"({cmd}) >> {escape_shell_arg(remote_log_file)} 2>&1",
                 "exit_code=$?",
+                self._sync_outputs_command(remote_work_dir, remote_sync_dir),
                 (
                     "printf '[%s] $ exit_code: %s\\n' "
                     "\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" "

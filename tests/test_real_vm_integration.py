@@ -57,7 +57,10 @@ def test_real_vm_agent_workflow(tmp_path):
     state_dir = tmp_path / "state"
     local_dir = tmp_path / "artifacts"
     session_name = "exp-agent-e2e"
-    command = 'pwd && printf "agent-e2e-ok\\n" > artifacts/e2e.txt && cat artifacts/e2e.txt'
+    labsetup_dir = tmp_path / "Labsetup"
+    labsetup_dir.mkdir()
+    (labsetup_dir / "input.txt").write_text("agent-e2e-ok\n")
+    command = "pwd && cat Labsetup/input.txt > artifacts/e2e.txt && cat artifacts/e2e.txt"
 
     env = os.environ.copy()
     env["SEED_RUNNER_STATE_DIR"] = str(state_dir)

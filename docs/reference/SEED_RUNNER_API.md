@@ -1,4 +1,4 @@
-# seed-runner API 规范 v2
+# seed-runner API 规范 v3
 
 ## 概述
 
@@ -10,6 +10,7 @@
 - 挂载管理和 session 管理分离
 - 所有输出自动写入共享文件夹，Agent 通过本地文件读取
 - Agent 使用相对路径操作，对远程文件系统无感知
+- 共享目录只承担同步职责，Agent 面向的是远端本地磁盘工作目录
 
 ---
 
@@ -28,12 +29,18 @@ seed-runner (本地工具)
     │  └─ 写入日志文件
     └─ 日志管理层
        └─ 按 session name 组织日志
+    ├─ 同步层
+    │  └─ 将共享目录同步到远端本地工作目录
     ↓ (SSH + tmux)
 远程 VM
-    ├─ 执行命令
-    ├─ 生成输出
-    └─ 写入文件系统
-    ↓ (远端通过 sshfs 挂载本地共享目录)
+    ├─ hidden sync dir
+    │  └─ 通过 sshfs 挂载本地共享目录（不直接暴露给 Agent）
+    ├─ remote exec dir
+    │  ├─ 位于远端本地磁盘
+    │  ├─ docker-compose / ELF / sudo 等在这里运行
+    │  └─ Agent 看到的 remote_work_dir 指向这里
+    └─ 执行命令并生成输出
+    ↓ (日志与产物同步回本地共享目录)
 本地共享目录
     ├─ logs/
     │  ├─ exp-web-01/
@@ -68,8 +75,8 @@ seed-runner mount create \
 
 **参数**：
 - `--machine` (必需) — 目标机器的标识符，对应 SSH 配置中的 host
-- `--local-dir` (必需) — 本地共享目录路径（将被远程 VM 通过 sshfs 挂载）
-- `--remote-dir` (可选) — 远程 VM 中的实验目录路径，默认 `~/seed-experiment`
+- `--local-dir` (必需) — 本地共享目录路径（用于日志、证据和输入同步）
+- `--remote-dir` (可选) — 远程 VM 中的实际工作目录路径，默认 `~/seed-experiment`
 - 如果默认路径与另一项仍在运行的实验冲突，可以显式指定唯一目录，例如 `/home/seed/seed-experiments/ARP_lab`
 - `--timeout` (可选) — 挂载操作的超时时间，单位秒，默认 30
 
@@ -87,9 +94,9 @@ seed-runner mount create \
 
 **行为**：
 1. 验证 SSH 连接到目标机器
-2. 在远程 VM 中创建实验目录（如果不存在）
-3. 在本地创建共享目录（如果不存在）
-4. 在远程 VM 中执行 sshfs，将本地目录挂载到远程实验目录
+2. 在远程 VM 中准备一个隐藏的 sync 目录，并通过 sshfs 挂载本地共享目录
+3. 在远程 VM 中准备实际执行用的本地工作目录（即 `--remote-dir`）
+4. 后续 session 将把共享目录内容同步到该工作目录，再在该目录中执行命令
 5. 返回 mount_id 供后续使用
 
 **错误处理**：
@@ -204,8 +211,8 @@ seed-runner session create \
 5. 返回 session_id 供后续命令使用
 
 **关键设计**：
-- Session 创建时自动进入挂载的远程路径
-- Agent 之后使用相对路径操作，对远程文件系统无感知
+- Session 创建时自动进入远端本地磁盘工作目录，而不是 sshfs 挂载目录
+- Agent 之后使用相对路径操作，对同步与 staging 机制无感知
 - 日志按 session name 分组，便于查找和审计
 
 **错误处理**：
@@ -247,11 +254,17 @@ seed-runner session exec \
 
 **行为**：
 1. 验证 session 存在且状态为 active
-2. 在 tmux session 中执行命令（整体执行，不拆分）
-3. 捕获 stdout、stderr、exit code
-4. 将输出写入 `<remote_work_dir>/logs/<session-name>/<log-filename>`
-5. 日志通过共享目录自动同步到本地（底层由远程 VM 挂载本地目录实现）
-6. 返回执行结果（包含本地和远程路径）
+2. 在命令执行前，将共享目录中的输入同步到 `remote_work_dir`
+3. 在 tmux session 中于 `remote_work_dir` 执行命令（整体执行，不拆分）
+4. 捕获 stdout、stderr、exit code
+5. 将输出写入 `<remote_work_dir>/logs/<session-name>/<log-filename>`
+6. 将日志与产物同步回本地共享目录
+7. 返回执行结果（包含本地和远程路径）
+
+**工作目录语义**：
+- `remote_work_dir` 是远端本地磁盘目录，是 Agent 应该操作的唯一路径
+- 底层 sshfs 挂载目录属于内部实现细节，不直接暴露给 Agent
+- Docker bind mount、本地 ELF、sudo 读脚本等都应以 `remote_work_dir` 为准
 
 **日志文件命名**：
 - 自动递增：`cmd_001.log`, `cmd_002.log`, ...
