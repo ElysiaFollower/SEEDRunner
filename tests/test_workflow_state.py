@@ -102,7 +102,7 @@ def test_mount_manager_reads_runtime_settings_from_env_file(env_file, temp_dir, 
     assert mount_info["local_ssh_port"] == 2200
     assert mount_info["local_user"] == "ely"
     assert mount_info["remote_to_local_key"] == "~/.ssh/id_ed25519"
-    assert mount_info["local_workspace_root"] == temp_dir
+    assert mount_info["local_path"] == os.path.join(temp_dir, "artifacts")
     assert mount_info["remote_sync_dir"].endswith("/sync")
 
 
@@ -132,7 +132,7 @@ def test_mount_create_reuses_existing_remote_mount_for_same_source(temp_dir, mon
         if "findmnt -n -o SOURCE" in cmd:
             return FakeCompletedProcess(
                 returncode=0,
-                stdout=f"ely@10.0.0.5:{temp_dir}\n",
+                stdout=f"ely@10.0.0.5:{os.path.join(temp_dir, 'artifacts')}\n",
             )
         return FakeCompletedProcess(returncode=0)
 
@@ -224,6 +224,35 @@ def test_mount_destroy_raises_when_remote_mount_is_still_active(temp_dir, monkey
     assert state["mounts"]["mnt_test"]["status"] == "mounted"
 
 
+def test_mount_status_persists_runtime_error(temp_dir, monkeypatch):
+    """Mount status should reconcile stale persisted records when the remote mount is gone."""
+    monkeypatch.setenv("SEED_RUNNER_STATE_DIR", os.path.join(temp_dir, "state"))
+
+    state = load_state()
+    state["mounts"]["mnt_test"] = {
+        "mount_id": "mnt_test",
+        "machine": "vm-seed-01",
+        "local_path": os.path.join(temp_dir, "artifacts"),
+        "remote_sync_dir": "/home/seed/.seed-runner/mounts/mnt_test/sync",
+        "remote_path": "/home/seed/seed-experiment",
+        "status": "mounted",
+        "mounted_at": "2026-04-08T11:00:00Z",
+        "session_ids": [],
+    }
+    save_state(state)
+
+    monkeypatch.setattr(
+        "seed_runner.mount.run_ssh_command",
+        lambda *args, **kwargs: FakeCompletedProcess(returncode=1),
+    )
+
+    result = MountManager().status("mnt_test")
+
+    assert result["status"] == "error"
+    state = load_state()
+    assert state["mounts"]["mnt_test"]["status"] == "error"
+
+
 def test_session_lifecycle_updates_state_and_metadata(temp_dir, monkeypatch):
     """Session create/exec/destroy should survive across manager instances and update metadata."""
     key_path = os.path.join(temp_dir, "id_test")
@@ -249,7 +278,7 @@ def test_session_lifecycle_updates_state_and_metadata(temp_dir, monkeypatch):
 
     def fake_session_execute(machine_id, cmd, timeout=30):
         if "tmux new-window" in cmd:
-            log_file = os.path.join(local_dir, "logs", "exp-web-01", "cmd_001.log")
+            log_file = os.path.join(local_dir, "artifacts", "logs", "exp-web-01", "cmd_001.log")
             os.makedirs(os.path.dirname(log_file), exist_ok=True)
             with open(log_file, "w") as f:
                 f.write("[2026-04-07T10:30:15Z] $ echo hello\n")
@@ -278,7 +307,9 @@ def test_session_lifecycle_updates_state_and_metadata(temp_dir, monkeypatch):
 
     destroy_result = SessionManager().destroy(created_session["session_id"])
     assert destroy_result["status"] == "destroyed"
-    assert destroy_result["logs_location"] == os.path.join(local_dir, "logs", "exp-web-01")
+    assert destroy_result["logs_location"] == os.path.join(
+        local_dir, "artifacts", "logs", "exp-web-01"
+    )
 
     final_status = SessionManager().status(created_session["session_id"])
     assert final_status["status"] == "destroyed"
@@ -375,7 +406,7 @@ def test_session_exec_rejects_concurrent_commands_on_same_session(temp_dir, monk
 
         def write_log():
             time.sleep(0.25)
-            log_file = os.path.join(local_dir, "logs", "exp-web-01", "cmd_001.log")
+            log_file = os.path.join(local_dir, "artifacts", "logs", "exp-web-01", "cmd_001.log")
             os.makedirs(os.path.dirname(log_file), exist_ok=True)
             with open(log_file, "w") as f:
                 f.write("[2026-04-08T10:30:15Z] $ echo first\n")
@@ -418,3 +449,41 @@ def test_session_exec_rejects_concurrent_commands_on_same_session(temp_dir, monk
     assert len(commands) == 1
     assert commands[0]["index"] == 1
     assert commands[0]["cmd"] == "echo first"
+
+
+def test_session_status_persists_timeout(temp_dir, monkeypatch):
+    """Session status should reconcile stale persisted records after the timeout window passes."""
+    monkeypatch.setenv("SEED_RUNNER_STATE_DIR", os.path.join(temp_dir, "state"))
+
+    state = load_state()
+    state["mounts"]["mnt_test"] = {
+        "mount_id": "mnt_test",
+        "machine": "vm-seed-01",
+        "local_path": os.path.join(temp_dir, "artifacts"),
+        "remote_sync_dir": "/home/seed/.seed-runner/mounts/mnt_test/sync",
+        "remote_path": "/home/seed/seed-experiment",
+        "status": "mounted",
+        "mounted_at": "2026-04-08T11:00:00Z",
+        "session_ids": ["sess_test"],
+    }
+    state["sessions"]["sess_test"] = {
+        "session_id": "sess_test",
+        "session_name": "exp-web-01",
+        "machine": "vm-seed-01",
+        "mount_id": "mnt_test",
+        "local_mount_point": os.path.join(temp_dir, "artifacts"),
+        "remote_work_dir": "/home/seed/seed-experiment",
+        "status": "active",
+        "tmux_session": "seed_sess_test",
+        "created_at": "2026-04-08T10:00:00Z",
+        "command_count": 0,
+        "timeout_seconds": 1,
+        "busy": False,
+    }
+    save_state(state)
+
+    result = SessionManager().status("sess_test")
+
+    assert result["status"] == "timeout"
+    state = load_state()
+    assert state["sessions"]["sess_test"]["status"] == "timeout"

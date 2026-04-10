@@ -33,11 +33,11 @@ Do not use this skill to modify or debug the `seed-runner` implementation itself
 
 1. Choose the target experiment directory under `runs/`, for example `runs/ARP_Attack/` or `runs/Sniffing_Spoofing/`.
 2. Read the experiment manual and lab setup files in that directory before issuing commands.
-3. Create a local shared directory inside that workspace, usually `./artifacts` for the task.
+3. Choose a **mount root** directory (this is `--local-dir`): for example `./workspace`. That directory is the full sshfs mount root. Under it, only `artifacts/` is reserved (command logs under `artifacts/logs/<session-name>/`, plus synced outputs under `artifacts/`). The rest of the mount root is yours (e.g. `Labsetup/`, scripts). Prefer a name other than `artifacts` for the mount root so paths stay readable; if the mount root is literally `./artifacts`, logs appear at `./artifacts/artifacts/logs/...`.
 4. Create a mount:
 
 ```bash
-seed-runner mount create --machine <machine-id> --local-dir ./artifacts
+seed-runner mount create --machine <machine-id> --local-dir ./workspace
 ```
 
 If the default remote mount point is occupied by another experiment, retry with
@@ -46,7 +46,7 @@ an explicit per-experiment path such as:
 ```bash
 seed-runner mount create \
   --machine <machine-id> \
-  --local-dir ./artifacts \
+  --local-dir ./workspace \
   --remote-dir /home/seed/seed-experiments/<experiment-name>
 ```
 
@@ -64,8 +64,8 @@ seed-runner session exec --session <session-id> --cmd "<shell-command>"
 
 7. After each command:
 - inspect the returned `exit_code`
-- read `log_file_local`
-- inspect files under `<local-dir>/artifacts/` when the command is expected to create outputs
+- read `log_file_local` (under `<local-dir>/artifacts/logs/<session-name>/` by convention)
+- inspect files under `<local-dir>/artifacts/` for synced outputs and evidence (paths besides `logs/` are experiment-dependent)
 
 8. Use `seed-runner session status --session <session-id>` when you need current status, command count, or the last command context.
 9. Save a complete Chinese report under `./report/`, grounded in logs and artifacts from the run.
@@ -78,7 +78,7 @@ seed-runner session exec --session <session-id> --cmd "<shell-command>"
 - Use relative paths inside the remote work directory unless there is a clear reason not to.
 - Assume `seed-runner` handles sync/staging before command execution. You should operate on the returned `remote_work_dir` as if it were a normal remote directory.
 - If a task is long-running, set a larger `--timeout` instead of assuming the default is enough.
-- If you need durable evidence, write it under `artifacts/` so it lands in the local shared directory.
+- Command logs: use the returned `log_file_local` (under `<local-dir>/artifacts/logs/`). Other durable outputs from the remote run appear under `<local-dir>/artifacts/` after sync. You may add your own files anywhere under the mount root (for example next to `Labsetup/`) as long as you avoid colliding with tool-managed paths under `artifacts/`.
 - Keep notes, reports, and intermediate files inside the current `runs/<experiment-name>/` workspace so the tool repository stays clean.
 - A successful run is not just command execution. It must end with a usable report that a human can read without replaying the entire session.
 

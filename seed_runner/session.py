@@ -15,6 +15,11 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _local_session_logs_dir(local_mount_point: str, session_name: str) -> str:
+    """Where command logs land under the local mount root (mirrors remote_sync_dir/artifacts/logs/)."""
+    return os.path.join(local_mount_point, "artifacts", "logs", session_name)
+
+
 def _read_exit_code(log_file: str) -> Optional[int]:
     """Read the trailing exit code marker from a completed command log."""
     if not os.path.exists(log_file):
@@ -108,6 +113,22 @@ class SessionManager:
             state["sessions"][session_info["session_id"]] = session_info
             save_state(state)
 
+    def _persist_runtime_status(self, session_id: str, status: str) -> Optional[Dict[str, Any]]:
+        """Persist a runtime-derived session status so stale records get reconciled."""
+        with state_lock():
+            state = self._get_state()
+            session_info = state["sessions"].get(session_id)
+            if not session_info:
+                return None
+            if session_info.get("status") == "destroyed":
+                return session_info.copy()
+            if session_info.get("status") == status:
+                return session_info.copy()
+            session_info["status"] = status
+            state["sessions"][session_id] = session_info
+            save_state(state)
+            return session_info.copy()
+
     def _compute_status(
         self,
         session_info: Dict[str, Any],
@@ -128,7 +149,7 @@ class SessionManager:
         if mount is None:
             state = self._get_state()
             mount = state["mounts"].get(session_info["mount_id"])
-        if not mount or mount.get("status") == "unmounted":
+        if not mount or mount.get("status") != "mounted":
             return "error"
 
         result = run_ssh_command(
@@ -306,7 +327,7 @@ class SessionManager:
         remote_work_dir = mount["remote_path"]
         remote_sync_dir = mount["remote_sync_dir"]
 
-        ensure_dir(os.path.join(local_mount_point, "logs", session_name))
+        ensure_dir(_local_session_logs_dir(local_mount_point, session_name))
 
         execute_ssh_command(
             machine_id,
@@ -442,7 +463,7 @@ class SessionManager:
 
             command_index = session_info.get("command_count", 0) + 1
             log_filename = f"cmd_{command_index:03d}.log"
-            local_log_dir = os.path.join(local_mount_point, "logs", session_name)
+            local_log_dir = _local_session_logs_dir(local_mount_point, session_name)
             local_log_file = os.path.join(local_log_dir, log_filename)
             remote_log_dir = posixpath.join(remote_sync_dir, "artifacts", "logs", session_name)
             remote_log_file = os.path.join(remote_log_dir, log_filename)
@@ -554,6 +575,7 @@ class SessionManager:
         session_info = state["sessions"][session_id].copy()
         mount = state["mounts"].get(session_info["mount_id"])
         session_info["status"] = self._compute_status(session_info, mount)
+        self._persist_runtime_status(session_id, session_info["status"])
 
         created_at = parse_timestamp(session_info["created_at"])
         elapsed_seconds = int((_now_utc() - created_at).total_seconds())
@@ -578,9 +600,8 @@ class SessionManager:
                 check=False,
             )
 
-        logs_location = os.path.join(
+        logs_location = _local_session_logs_dir(
             session_info["local_mount_point"],
-            "logs",
             session_info["session_name"],
         )
         destroyed_at = get_timestamp()

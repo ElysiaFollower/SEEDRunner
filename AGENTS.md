@@ -32,11 +32,15 @@ Agents interact with `seed-runner` via command-line interface:
 
 ```bash
 cd runs/exp-web-01
-seed-runner mount create --machine vm-seed-01 --local-dir ./artifacts
+seed-runner mount create --machine vm-seed-01 --local-dir ./workspace
 seed-runner session create --machine vm-seed-01 --mount-id mnt_xxx --name exp-web-01
 seed-runner session exec --session sess_xxx --cmd "make"
 seed-runner session status --session sess_xxx
 ```
+
+`--local-dir` is the **full sshfs mount root** (here `./workspace`). The tool reserves only the subdirectory `artifacts/` under that root: command logs live under `artifacts/logs/<session-name>/`, and synced experiment outputs also land under `artifacts/`. Everything else at the mount root (for example `Labsetup/`, scripts, or docs) is for the agent to manage. `metadata.json` is written at the mount root by `seed-runner`.
+
+If you name the mount root `./artifacts` instead, logs become `./artifacts/artifacts/logs/...` (two `artifacts` segments in the path). Using a name like `workspace` avoids that.
 
 ### 2. File System
 
@@ -44,16 +48,18 @@ Agents should work inside a dedicated experiment directory under `runs/` and
 read execution logs and artifacts from the local mount point in that workspace:
 
 ```
-./runs/exp-web-01/artifacts/
-├── logs/
-│   └── exp-web-01/
-│       ├── cmd_001.log
-│       ├── cmd_002.log
-│       └── ...
-└── artifacts/
-    ├── code/
-    ├── results/
-    └── ...
+./runs/exp-web-01/workspace/          # --local-dir (mount root)
+├── metadata.json
+├── artifacts/                        # reserved: tool + sync outputs
+│   ├── logs/
+│   │   └── exp-web-01/
+│   │       ├── cmd_001.log
+│   │       ├── cmd_002.log
+│   │       └── ...
+│   ├── code/
+│   ├── results/
+│   └── ...
+└── (everything else: Labsetup, scripts, docs, … — agent-managed)
 ```
 
 ### 3. Skill/Tool Wrapper (Future)
@@ -87,7 +93,7 @@ def run_seed_experiment(machine_id: str, experiment_name: str, commands: List[st
 3. Agent executes experiment steps
    ├─ Loop:
    │  ├─ Execute command: seed-runner session exec ...
-   │  ├─ Read logs: cat ./artifacts/logs/.../cmd_XXX.log
+   │  ├─ Read logs: cat ./workspace/artifacts/logs/.../cmd_XXX.log
    │  ├─ Check acceptance criteria
    │  └─ If not met, adjust and retry
    └─ Until acceptance criteria met or max retries reached
@@ -147,7 +153,7 @@ def run_web_security_experiment(manual_path, labsetup_path, target_vm):
     acceptance_criteria = extract_acceptance_criteria(experiment)
     
     # 2. Initialize environment
-    mount = run_cmd("seed-runner mount create --machine {} --local-dir ./artifacts".format(target_vm))
+    mount = run_cmd("seed-runner mount create --machine {} --local-dir ./workspace".format(target_vm))
     session = run_cmd("seed-runner session create --machine {} --mount-id {} --name exp-web-01".format(
         target_vm, mount['mount_id']))
     
@@ -166,7 +172,7 @@ def run_web_security_experiment(manual_path, labsetup_path, target_vm):
         # If not met, try next step or retry
     
     # 4. Generate report
-    all_logs = collect_logs("./artifacts/logs/exp-web-01/")
+    all_logs = collect_logs("./workspace/artifacts/logs/exp-web-01/")
     report = generate_report(experiment, all_logs)
     save_report("./report/exp-web-01.zh.md", report)
     
@@ -184,7 +190,7 @@ def run_web_security_experiment(manual_path, labsetup_path, target_vm):
 Wrap `seed-runner` as a Claude Code Skill for direct integration:
 
 ```bash
-/seed-runner mount create --machine vm-seed-01 --local-dir ./artifacts
+/seed-runner mount create --machine vm-seed-01 --local-dir ./workspace
 ```
 
 ### Tool Integration

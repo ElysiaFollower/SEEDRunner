@@ -77,7 +77,7 @@ cd runs/exp-web-01
 # Create a mount
 seed-runner mount create \
   --machine vm-seed-01 \
-  --local-dir ./artifacts
+  --local-dir ./workspace
 
 # Create a session
 seed-runner session create \
@@ -100,9 +100,14 @@ seed-runner session destroy --session sess_20260407_001
 seed-runner mount destroy --mount-id mnt_20260407_001
 ```
 
-This keeps experiment outputs under `runs/<experiment>/artifacts/` and avoids
-mixing lab results with SEEDRunner source files. See [`runs/README.md`](runs/README.md)
-for the expected workspace layout.
+`--local-dir` is the mount root. Under that root, `artifacts/` is the tool-reserved
+directory: command logs are written to `artifacts/logs/<session-name>/`, and synced
+outputs are stored under `artifacts/`. Everything else in the mount root can be
+managed freely by the agent.
+
+This keeps experiment outputs under `runs/<experiment>/workspace/artifacts/` and
+avoids mixing lab results with SEEDRunner source files. See
+[`runs/README.md`](runs/README.md) for the expected workspace layout.
 
 ## Documentation
 

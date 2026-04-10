@@ -23,7 +23,7 @@ def _normalize_remote_dir(machine_user: str, remote_dir: Optional[str]) -> str:
 
 
 class MountManager:
-    """Manage remote sshfs mounts backed by a local workspace directory."""
+    """Manage remote sshfs mounts; ``--local-dir`` is the local mount root."""
 
     def __init__(
         self,
@@ -91,6 +91,21 @@ class MountManager:
             state["mounts"][mount_info["mount_id"]] = mount_info
             save_state(state)
 
+    def _persist_runtime_status(self, mount_id: str, status: str) -> None:
+        """Persist a runtime-derived mount status so stale records get reconciled."""
+        with state_lock():
+            state = load_state()
+            mount_info = state["mounts"].get(mount_id)
+            if not mount_info:
+                return
+            if mount_info.get("status") == "unmounted":
+                return
+            if mount_info.get("status") == status:
+                return
+            mount_info["status"] = status
+            state["mounts"][mount_id] = mount_info
+            save_state(state)
+
     def _tmux_sessions_using_path(self, machine_id: str, remote_path: str) -> Set[str]:
         """Discover tmux sessions whose panes currently live under the remote path."""
         result = run_ssh_command(
@@ -134,14 +149,13 @@ class MountManager:
 
         machine_config = get_machine_config(machine_id)
         local_path = os.path.abspath(local_dir)
-        local_workspace_root = os.path.dirname(local_path)
         remote_path = _normalize_remote_dir(machine_config.user, remote_dir)
         mount_id = generate_id("mnt")
         remote_sync_dir = f"/home/{machine_config.user}/.seed-runner/mounts/{mount_id}/sync"
         local_user = self.local_user or os.getenv("SEED_RUNNER_LOCAL_USER") or getpass.getuser()
         local_ssh_port = self.local_ssh_port or int(os.getenv("SEED_RUNNER_LOCAL_SSH_PORT", "22"))
         local_host = self._discover_local_host()
-        expected_source = f"{local_user}@{local_host}:{local_workspace_root}"
+        expected_source = f"{local_user}@{local_host}:{local_path}"
         remote_key = (
             self.remote_to_local_key
             or os.getenv("SEED_RUNNER_REMOTE_TO_LOCAL_KEY")
@@ -158,7 +172,6 @@ class MountManager:
                 raise ValueError(f"Remote directory already mounted: {remote_path}")
 
         ensure_dir(local_path)
-        ensure_dir(os.path.join(local_path, "logs"))
         ensure_dir(os.path.join(local_path, "artifacts"))
 
         reused_existing_mount = False
@@ -204,7 +217,6 @@ class MountManager:
             "mount_id": mount_id,
             "machine": machine_id,
             "local_path": local_path,
-            "local_workspace_root": local_workspace_root,
             "remote_path": remote_path,
             "remote_sync_dir": remote_sync_dir,
             "local_host": local_host,
@@ -223,7 +235,6 @@ class MountManager:
                 "mount_id": mount_id,
                 "machine": machine_id,
                 "local_path": local_path,
-                "local_workspace_root": local_workspace_root,
                 "remote_path": remote_path,
                 "remote_sync_dir": remote_sync_dir,
                 "mounted_at": mounted_at,
@@ -247,6 +258,7 @@ class MountManager:
                 check=False,
             )
             mount_info["status"] = "mounted" if verify.returncode == 0 else "error"
+            self._persist_runtime_status(mount_id, mount_info["status"])
 
         result = self._public_mount_info(mount_info)
         result["session_count"] = self._session_count(mount_info)
@@ -327,7 +339,9 @@ class MountManager:
                 session["status"] = "destroyed"
                 session["destroyed_at"] = unmounted_at
                 session["logs_preserved"] = True
-                session["logs_location"] = os.path.join(local_path, "logs", session["session_name"])
+                session["logs_location"] = os.path.join(
+                    local_path, "artifacts", "logs", session["session_name"]
+                )
                 session["busy"] = False
                 session.pop("active_command", None)
                 state["sessions"][session_id] = session
